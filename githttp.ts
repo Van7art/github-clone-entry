@@ -239,22 +239,25 @@ function fetchResponse(repo, args) {
   const depth = args.depth ?? null;
   const prevShallow = args.shallow ?? [];
   const parts = [];
-  // acknowledgments
-  parts.push(pktLine('acknowledgments\n'));
-  let common = [];
+  // acknowledgments: only when the client sent haves. Real git expects this
+  // section first when it sent haves, and rejects it when it sent none
+  // (a clone with no haves fails with "expected 'packfile', received
+  // 'acknowledgments'"; a fetch with haves fails the other way round).
   if (haves.length > 0) {
+    parts.push(pktLine('acknowledgments\n'));
+    let common = [];
     const dists = commitDistances(repo, wants);
     for (const have of haves) {
       if (dists.has(have) || wants.includes(have)) common.push(have);
     }
+    if (common.length > 0) {
+      for (const oid of common) parts.push(pktLine(`ACK ${oid}\n`));
+      parts.push(pktLine('ready\n'));
+    } else {
+      parts.push(pktLine('NAK\n'));
+    }
+    parts.push(pktLine('delim'));
   }
-  if (common.length > 0) {
-    for (const oid of common) parts.push(pktLine(`ACK ${oid}\n`));
-    parts.push(pktLine('ready\n'));
-  } else {
-    parts.push(pktLine('NAK\n'));
-  }
-  parts.push(pktLine('delim'));
   const { objects, shallow, unshallow } = collectFetchObjects(repo, wants, haves, depth, prevShallow);
   if (depth !== null || prevShallow.length > 0) {
     parts.push(pktLine('shallow-info\n'));
@@ -359,7 +362,7 @@ export function handleReceivePack(repo, body) {
     for (const ref of refs) {
       lines.push(ref.ok ? `ok ${ref.name}\n` : `ng ${ref.name} ${ref.reason}\n`);
     }
-    const inner = encodePktLines(lines);
+    const inner = Buffer.concat([encodePktLines(lines), pktLine('flush')]);
     const outer = [];
     const CHUNK = 65500;
     for (let offset = 0; offset < inner.length; offset += CHUNK) {
