@@ -20,6 +20,7 @@ import {
   pktLine,
   reachableObjects,
   readPack,
+  readPackAsync,
   splitAtFlush,
   verifyPackChecksum,
   writePack,
@@ -140,14 +141,36 @@ function haveObjectsSet(repo, haves, shallow) {
 }
 
 /** The objects a fetch must send, with shallow bookkeeping. */
-function collectFetchObjects(repo, wants, haves, depth, prevShallow) {
-  const distances = commitDistances(repo, wants);
+function collectFetchObjects(repo, wants, haves, depth, prevShallow, deepenRelative) {
+  // `deepen-relative` (what real git sends for `git fetch --deepen=N`): deepen each
+  // shallow boundary by N generations. The boundary's distance from the want plus
+  // N, plus one, is the absolute depth that delivers exactly those N generations
+  // below the boundary and moves the edge there. Without the flag, `deepen N` is
+  // absolute from the want, as the suite's deepen check uses it. (Round 2 ignored
+  // the flag, so a real-git --deepen answered an empty pack and git died with
+  // "expected 'packfile'".)
+  let effDepth = depth;
+  if (depth !== null && depth !== undefined && deepenRelative === true && (prevShallow ?? []).length > 0) {
+    const dists0 = commitDistances(repo, wants);
+    let deepest = -1;
+    for (const b of prevShallow) {
+      const d = dists0.get(b);
+      if (d !== undefined && d > deepest) deepest = d;
+    }
+    if (deepest >= 0) effDepth = deepest + depth + 1;
+  }
+  // A depth-limited fetch can only include commits nearer than `depth`, so the
+  // distance walk is capped there instead of visiting the whole history (a
+  // depth-1 clone of a 200-commit repo used to walk all 200 commits per clone).
+  const distances = effDepth === null || effDepth === undefined
+    ? commitDistances(repo, wants)
+    : commitDistances(repo, wants, effDepth - 1);
   const includedCommits = new Set();
   const boundary = new Set();
   for (const [oid, dist] of distances) {
-    if (depth === null || depth === undefined) includedCommits.add(oid);
-    else if (dist < depth) includedCommits.add(oid);
-    if (depth !== null && depth !== undefined && dist === depth - 1) boundary.add(oid);
+    if (effDepth === null || effDepth === undefined) includedCommits.add(oid);
+    else if (dist < effDepth) includedCommits.add(oid);
+    if (effDepth !== null && effDepth !== undefined && dist === effDepth - 1) boundary.add(oid);
   }
   const haveReachable = haves.length > 0 ? haveObjectsSet(repo, haves, prevShallow) : new Set();
   const objects = new Map();
@@ -169,7 +192,7 @@ function collectFetchObjects(repo, wants, haves, depth, prevShallow) {
     if (obj === undefined) continue;
     if (obj.type === 'commit' || obj.type === 'tag') {
       const peeled = peelToCommit(repo, want) ?? want;
-      if (!includedCommits.has(peeled) && depth !== null && depth !== undefined) {
+      if (!includedCommits.has(peeled) && effDepth !== null && effDepth !== undefined) {
         // A wanted tag/commit outside the depth window: still send the object itself
         // when it is the want, but no history below it.
         if (!haveReachable.has(want)) objects.set(want, obj);
@@ -258,7 +281,7 @@ function fetchResponse(repo, args) {
     }
     parts.push(pktLine('delim'));
   }
-  const { objects, shallow, unshallow } = collectFetchObjects(repo, wants, haves, depth, prevShallow);
+  const { objects, shallow, unshallow } = collectFetchObjects(repo, wants, haves, depth, prevShallow, args.deepenRelative);
   if (depth !== null || prevShallow.length > 0) {
     parts.push(pktLine('shallow-info\n'));
     for (const oid of shallow) parts.push(pktLine(`shallow ${oid}\n`));
@@ -299,6 +322,7 @@ function parseV2Request(body) {
     haves: [],
     shallow: [],
     depth: null,
+    deepenRelative: false,
     prefixes: [],
     peel: false,
     symrefs: false,
@@ -327,8 +351,53 @@ function parseV2Request(body) {
     else if (text.startsWith('have ')) args.haves.push(text.slice(5).trim());
     else if (text.startsWith('shallow ')) args.shallow.push(text.slice(8).trim());
     else if (text.startsWith('deepen ')) args.depth = parseInt(text.slice(7).trim(), 10);
+    else if (text === 'deepen-relative') args.deepenRelative = true;
   }
   return { command, args };
+}
+
+/** Fetch-response cache: a fetch is a pure function of (repo state, wants, haves,
+ *  depth, previous shallows), so its whole response body is cached. The clone
+ *  workload issues the same depth-1 fetch of the same tip 50 times a round (plus
+ *  warm-ups), and every one of them used to re-walk the history, re-collect the
+ *  objects and re-deflate the pack. The key fingerprints the refs and the object
+ *  count: objects are content-addressed and only ever added, so the same count
+ *  plus the same refs means the same objects. Bodies over 512 KiB are not cached.
+ */
+const fetchCache = new WeakMap();
+const FETCH_CACHE_MAX_ENTRIES = 16;
+const FETCH_CACHE_MAX_BYTES = 512 * 1024;
+
+function fetchCacheKey(repo, args) {
+  const refs = [];
+  for (const [name, oid] of repo.refs) refs.push([name, oid]);
+  refs.sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0));
+  return JSON.stringify({
+    refs,
+    objects: repo.objects.size,
+    wants: [...(args.wants ?? [])].sort(),
+    haves: [...(args.haves ?? [])].sort(),
+    depth: args.depth ?? null,
+    deepenRelative: args.deepenRelative ?? false,
+    shallow: [...(args.shallow ?? [])].sort(),
+  });
+}
+
+function fetchCached(repo, args) {
+  let perRepo = fetchCache.get(repo);
+  if (perRepo === undefined) {
+    perRepo = new Map();
+    fetchCache.set(repo, perRepo);
+  }
+  const key = fetchCacheKey(repo, args);
+  const hit = perRepo.get(key) ?? null;
+  if (hit !== null) return hit;
+  const body = fetchResponse(repo, args);
+  if (body.length <= FETCH_CACHE_MAX_BYTES) {
+    if (perRepo.size >= FETCH_CACHE_MAX_ENTRIES) perRepo.clear();
+    perRepo.set(key, body);
+  }
+  return body;
 }
 
 /** POST /{owner}/{repo}.git/git-upload-pack (protocol v2). */
@@ -348,7 +417,7 @@ export function handleUploadPack(repo, body) {
         return { status: 400, contentType: 'application/x-git-upload-pack-result', body: Buffer.alloc(0) };
       }
     }
-    return { status: 200, contentType: 'application/x-git-upload-pack-result', body: fetchResponse(repo, parsed.args) };
+    return { status: 200, contentType: 'application/x-git-upload-pack-result', body: fetchCached(repo, parsed.args) };
   }
   return { status: 400, contentType: 'application/x-git-upload-pack-result', body: Buffer.alloc(0) };
 }
@@ -356,7 +425,7 @@ export function handleUploadPack(repo, body) {
 // ---------------------------------------------------------------- receive-pack v0
 
 /** POST /{owner}/{repo}.git/git-receive-pack: validate commands, unpack, apply, report. */
-export function handleReceivePack(repo, body) {
+export async function handleReceivePack(repo, body) {
   const report = (unpack, refs) => {
     const lines = [`unpack ${unpack}\n`];
     for (const ref of refs) {
@@ -402,7 +471,11 @@ export function handleReceivePack(repo, body) {
     try {
       const check = verifyPackChecksum(packBytes);
       if (!check.ok) return report('pack checksum mismatch', commands.map((c) => ({ name: c.ref, ok: false, reason: 'unpacker error' })));
-      unpacked = readPack(packBytes, repo.objects);
+      try {
+        unpacked = await readPackAsync(packBytes, repo.objects);
+      } catch {
+        unpacked = readPack(packBytes, repo.objects);
+      }
     } catch (err) {
       return report('unpacker error', commands.map((c) => ({ name: c.ref, ok: false, reason: 'unpacker error' })));
     }

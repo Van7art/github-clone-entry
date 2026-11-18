@@ -3,7 +3,7 @@
 // (its `objects` map) or on plain buffers. SHA-1 throughout, as the suite speaks sha1.
 
 import { createHash } from 'node:crypto';
-import { deflateSync, inflateSync } from 'node:zlib';
+import { createInflate, deflateSync, inflateSync } from 'node:zlib';
 import { ZERO_OID } from './store.ts';
 
 export const TYPE_CODES = Object.freeze({ commit: 1, tree: 2, blob: 3, tag: 4 });
@@ -194,10 +194,15 @@ export function peelToCommit(repo, oid) {
 
 // ---------------------------------------------------------------- reachability
 
-/** Walk commit parents from `tips` (BFS); returns Map oid -> distance (0 = a tip). */
-export function commitDistances(repo, tips) {
+/** Walk commit parents from `tips` (BFS); returns Map oid -> distance (0 = a tip).
+ *  The queue is an index pointer (no shift(): the old shift() made this O(n^2) on
+ *  long histories). `maxDepth` caps the walk: with it, only commits at distance
+ *  <= maxDepth are returned and only those below maxDepth are expanded, so a
+ *  depth-limited fetch visits just the commits it can include. */
+export function commitDistances(repo, tips, maxDepth) {
   const dist = new Map();
   const queue = [];
+  let head = 0;
   for (const tip of tips) {
     const peeled = peelToCommit(repo, tip) ?? tip;
     if (repo.objects.get(peeled)?.type === 'commit' && !dist.has(peeled)) {
@@ -205,9 +210,11 @@ export function commitDistances(repo, tips) {
       queue.push(peeled);
     }
   }
-  while (queue.length > 0) {
-    const oid = queue.shift();
+  const cap = maxDepth === undefined || maxDepth === null ? Infinity : maxDepth;
+  while (head < queue.length) {
+    const oid = queue[head++];
     const depth = dist.get(oid);
+    if (depth >= cap) continue;
     const obj = repo.objects.get(oid);
     if (obj === undefined || obj.type !== 'commit') continue;
     for (const parent of parseCommit(obj.data).parents) {
@@ -220,11 +227,28 @@ export function commitDistances(repo, tips) {
   return dist;
 }
 
-/** True when `ancestor` is reachable from `oid` (or equal to it). */
+/** True when `ancestor` is reachable from `oid` (or equal to it). A targeted DFS
+ *  from the tip that stops the moment the ancestor is found: the old full-history
+ *  BFS walked (and parsed) every commit on every push, which is O(history) per
+ *  push even when the ancestor is the direct parent, as it is for a fast-forward. */
 export function isAncestor(repo, ancestor, oid) {
   if (ancestor === oid) return true;
-  const dist = commitDistances(repo, [oid]);
-  return dist.has(ancestor);
+  const start = peelToCommit(repo, oid) ?? oid;
+  if (start === ancestor) return true;
+  const seen = new Set();
+  const stack = [start];
+  while (stack.length > 0) {
+    const current = stack.pop();
+    if (seen.has(current)) continue;
+    seen.add(current);
+    const obj = repo.objects.get(current);
+    if (obj === undefined || obj.type !== 'commit') continue;
+    for (const parent of parseCommit(obj.data).parents) {
+      if (parent === ancestor) return true;
+      stack.push(parent);
+    }
+  }
+  return false;
 }
 
 /** The merge-base of two commits: the nearest common ancestor, or null. */
@@ -354,7 +378,8 @@ export function readPack(pack, haveObjects) {
       baseOid = buf.subarray(offset, offset + 20).toString('hex');
       offset += 20;
     }
-    const end = findDeflateEnd(buf, offset, size);
+    // The last entry runs to the pack trailer (20 bytes): no search needed.
+    const end = i === count - 1 ? buf.length - 20 : findDeflateEnd(buf, offset, size);
     const data = inflateSync(buf.subarray(offset, end));
     if (data.length !== size) throw new Error('pack entry size mismatch');
     entries.push({ offset: entryOffset, typeCode, baseOffset, baseOid, data });
@@ -362,6 +387,7 @@ export function readPack(pack, haveObjects) {
   }
   const objects = new Map();
   const byOffset = new Map(entries.map((e) => [e.offset, e]));
+  let oidIndex = null;
   const resolvedByOffset = new Map();
   const resolve = (entry, seen) => {
     if (resolvedByOffset.has(entry.offset)) return resolvedByOffset.get(entry.offset);
@@ -377,12 +403,29 @@ export function readPack(pack, haveObjects) {
         if (baseEntry === undefined) throw new Error('ofs-delta base not in pack');
         base = resolve(baseEntry, seen);
       } else {
-        for (const candidate of entries) {
-          if (candidate.offset === entry.offset) continue;
-          const tried = resolve(candidate, new Set(seen));
-          if (hashObject(tried.type, tried.data) === entry.baseOid) {
-            base = tried;
-            break;
+        // Fast path: direct objects are indexed by oid once (one hash each), so a
+        // REF-delta base that is a plain object is found without re-resolving and
+        // re-hashing every entry for every delta (the old loop was O(n^2) hashes).
+        if (oidIndex === null) {
+          oidIndex = new Map();
+          for (const direct of entries) {
+            if (direct.typeCode >= 1 && direct.typeCode <= 4) {
+              const resolvedDirect = resolve(direct, new Set());
+              oidIndex.set(hashObject(resolvedDirect.type, resolvedDirect.data), direct);
+            }
+          }
+        }
+        const baseEntry = oidIndex.get(entry.baseOid);
+        if (baseEntry !== undefined) {
+          base = resolve(baseEntry, new Set(seen));
+        } else {
+          for (const candidate of entries) {
+            if (candidate.offset === entry.offset) continue;
+            const tried = resolve(candidate, new Set(seen));
+            if (hashObject(tried.type, tried.data) === entry.baseOid) {
+              base = tried;
+              break;
+            }
           }
         }
         if (base === null && haveObjects !== undefined && haveObjects.has(entry.baseOid)) {
@@ -461,6 +504,135 @@ export function writePack(objects) {
   }
   const body = Buffer.concat(parts);
   return Buffer.concat([body, Buffer.from(sha1(body), 'hex')]);
+}
+
+/** Inflate one pack entry's deflate stream with a streaming Inflate, returning its
+ *  data and the offset just past the stream. The stream's bytesWritten once the
+ *  stream ends is exactly the consumed input length, so this needs one inflate
+ *  and no binary search with throwing probes (the sync findDeflateEnd spends
+ *  ~0.1 ms per throwing probe). Rejects when the stream errors, yields the wrong
+ *  size, or does not finish promptly; the caller falls back to the sync reader. */
+export function inflateEntryAsync(buf, offset, expectedSize) {
+  return new Promise((resolve, reject) => {
+    const inf = createInflate();
+    const chunks = [];
+    let settled = false;
+    const timer = setTimeout(() => done(new Error('inflate timed out')), 1000);
+    const done = (err, result) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      inf.destroy();
+      if (err !== null && err !== undefined) reject(err);
+      else resolve(result);
+    };
+    inf.on('data', (chunk) => chunks.push(chunk));
+    inf.on('error', (err) => done(err));
+    inf.on('end', () => {
+      const data = Buffer.concat(chunks);
+      if (data.length !== expectedSize) done(new Error('pack entry size mismatch'));
+      else done(null, { data, end: offset + inf.bytesWritten });
+    });
+    inf.write(buf.subarray(offset));
+  });
+}
+
+/** Async readPack: same objects and delta resolution as readPack, but each
+ *  entry is inflated with one streaming Inflate instead of the binary search.
+ *  Any failure rejects so the caller can fall back to the sync reader. */
+export async function readPackAsync(pack, haveObjects) {
+  const buf = Buffer.isBuffer(pack) ? pack : Buffer.from(pack);
+  if (buf.length < 32 || buf.subarray(0, 4).toString('ascii') !== 'PACK') throw new Error('not a packfile');
+  const version = buf.readUInt32BE(4);
+  if (version !== 2) throw new Error(`unsupported pack version ${version}`);
+  const count = buf.readUInt32BE(8);
+  const entries = [];
+  let offset = 12;
+  for (let i = 0; i < count; i += 1) {
+    const entryOffset = offset;
+    let byte = buf[offset++];
+    const typeCode = (byte >> 4) & 0x07;
+    let size = byte & 0x0f;
+    let shift = 4;
+    while ((byte & 0x80) !== 0) {
+      byte = buf[offset++];
+      size |= (byte & 0x7f) << shift;
+      shift += 7;
+    }
+    let baseOffset = null;
+    let baseOid = null;
+    if (typeCode === 6) {
+      byte = buf[offset++];
+      let base = byte & 0x7f;
+      while ((byte & 0x80) !== 0) {
+        byte = buf[offset++];
+        base = ((base + 1) << 7) | (byte & 0x7f);
+      }
+      baseOffset = entryOffset - base;
+    } else if (typeCode === 7) {
+      baseOid = buf.subarray(offset, offset + 20).toString('hex');
+      offset += 20;
+    }
+    const { data, end } = await inflateEntryAsync(buf, offset, size);
+    entries.push({ offset: entryOffset, typeCode, baseOffset, baseOid, data });
+    offset = end;
+  }
+  const objects = new Map();
+  const byOffset = new Map(entries.map((e) => [e.offset, e]));
+  let oidIndex = null;
+  const resolvedByOffset = new Map();
+  const resolve = (entry, seen) => {
+    if (resolvedByOffset.has(entry.offset)) return resolvedByOffset.get(entry.offset);
+    if (seen.has(entry.offset)) throw new Error('delta cycle in pack');
+    seen.add(entry.offset);
+    let resolved;
+    if (entry.typeCode >= 1 && entry.typeCode <= 4) {
+      resolved = { type: CODE_TYPES[entry.typeCode], data: entry.data };
+    } else {
+      let base = null;
+      if (entry.typeCode === 6) {
+        const baseEntry = byOffset.get(entry.baseOffset);
+        if (baseEntry === undefined) throw new Error('ofs-delta base not in pack');
+        base = resolve(baseEntry, seen);
+      } else {
+        if (oidIndex === null) {
+          oidIndex = new Map();
+          for (const direct of entries) {
+            if (direct.typeCode >= 1 && direct.typeCode <= 4) {
+              const resolvedDirect = resolve(direct, new Set());
+              oidIndex.set(hashObject(resolvedDirect.type, resolvedDirect.data), direct);
+            }
+          }
+        }
+        const baseEntry = oidIndex.get(entry.baseOid);
+        if (baseEntry !== undefined) {
+          base = resolve(baseEntry, new Set(seen));
+        } else {
+          for (const candidate of entries) {
+            if (candidate.offset === entry.offset) continue;
+            const tried = resolve(candidate, new Set(seen));
+            if (hashObject(tried.type, tried.data) === entry.baseOid) {
+              base = tried;
+              break;
+            }
+          }
+        }
+        if (base === null && haveObjects !== undefined && haveObjects.has(entry.baseOid)) {
+          base = haveObjects.get(entry.baseOid);
+        }
+        if (base === null) throw new Error('ref-delta base not available');
+      }
+      resolved = { type: base.type, data: applyDelta(base.data, entry.data) };
+    }
+    resolvedByOffset.set(entry.offset, resolved);
+    return resolved;
+  };
+  for (const entry of entries) {
+    const resolved = resolve(entry, new Set());
+    const oid = hashObject(resolved.type, resolved.data);
+    objects.set(oid, resolved);
+  }
+  return objects;
 }
 
 /** Verify a packfile's trailer checksum. */

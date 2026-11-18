@@ -101,7 +101,7 @@ export function createApp() {
           return;
         }
         if (method === 'POST' && service === 'git-receive-pack') {
-          const result = handleReceivePack(repo, body);
+          const result = await handleReceivePack(repo, body);
           sendRaw(res, result.status, result.body, result.contentType);
           return;
         }
